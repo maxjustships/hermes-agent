@@ -40,6 +40,7 @@ import base64
 from collections import deque
 import concurrent.futures
 import functools
+from io import BytesIO
 import json
 import logging
 import math
@@ -54,6 +55,8 @@ import time
 import uuid
 from pathlib import PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
+
+from PIL import Image
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use.backend import (
@@ -179,6 +182,14 @@ _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport (fallback when the
 # sentinels to a desktop/shell window from `list_windows` instead.
 _SCREEN_CAPTURE_SENTINELS = {"screen", "desktop", "fullscreen", "full screen", "all"}
 _PRIMARY_DESKTOP_TARGET = {"kind": "desktop", "display_id": "primary"}
+_HYPRCTL_TIMEOUT_SECONDS = 2.0
+_HYPRLAND_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]+$")
+_REVERSE_DNS_PREFIXES = frozenset({"com", "org", "net", "io", "dev"})
+_REVERSE_DNS_APP_ALIASES = {
+    "orgchromiumchromium": frozenset({"chromium"}),
+    "orgmozillafirefox": frozenset({"firefox"}),
+}
+_APP_ID_SUFFIXES = frozenset({"app", "application", "browser", "desktop"})
 
 # Known shell/desktop window identifiers across platforms. Matched
 # case-insensitively as a substring against both the window's app_name and
@@ -209,6 +220,113 @@ def _finite_number(value: Any) -> Optional[float]:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _hyprctl_json(query: str) -> Any:
+    """Return one bounded, shell-free Hyprland JSON query, or ``None``.
+
+    Hyprland data is untrusted compositor state. Never include it in errors or
+    logs: client titles can contain private document names and page content.
+    """
+    try:
+        proc = subprocess.run(
+            ["hyprctl", "-j", query],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_HYPRCTL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _app_identity_aliases(value: Any) -> set[str]:
+    """Build strict app-id aliases without title or substring matching."""
+    if not isinstance(value, str) or not value.strip():
+        return set()
+    parts = re.findall(r"[a-z0-9]+", value.casefold())
+    if not parts:
+        return set()
+
+    normalized = "".join(parts)
+    aliases = {normalized}
+    core = list(parts)
+    reverse_dns = "." in value and core and core[0] in _REVERSE_DNS_PREFIXES
+    if reverse_dns:
+        aliases.update(_REVERSE_DNS_APP_ALIASES.get(normalized, ()))
+        return aliases
+    while len(core) > 1 and core[-1] in _APP_ID_SUFFIXES:
+        core.pop()
+    if core:
+        aliases.add("".join(core))
+    return aliases
+
+
+def _hyprland_client_geometry(client: Any) -> Optional[Dict[str, Any]]:
+    """Validate the stable identity and logical rectangle of one client."""
+    if not isinstance(client, dict):
+        return None
+    address = client.get("address")
+    if not isinstance(address, str) or not _HYPRLAND_ADDRESS_RE.fullmatch(address):
+        return None
+    if client.get("mapped") is not True or client.get("hidden") is True:
+        return None
+    at = client.get("at")
+    size = client.get("size")
+    if not (
+        isinstance(at, list) and len(at) == 2
+        and isinstance(size, list) and len(size) == 2
+    ):
+        return None
+    x, y, width, height = (
+        _finite_number(at[0]),
+        _finite_number(at[1]),
+        _finite_number(size[0]),
+        _finite_number(size[1]),
+    )
+    if None in (x, y, width, height) or width <= 0 or height <= 0:
+        return None
+    return {
+        "address": address.casefold(),
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+    }
+
+
+def _matching_hyprland_clients(raw: Any, requested_app: str) -> List[Dict[str, Any]]:
+    """Return visible clients whose class exact-matches ``requested_app``."""
+    if not isinstance(raw, list):
+        return []
+    requested = _app_identity_aliases(requested_app)
+    if not requested:
+        return []
+    matches: List[Dict[str, Any]] = []
+    seen_addresses: set[str] = set()
+    for client in raw:
+        geometry = _hyprland_client_geometry(client)
+        if geometry is None or geometry["address"] in seen_addresses:
+            continue
+        identities: set[str] = set()
+        if isinstance(client, dict):
+            identities.update(_app_identity_aliases(client.get("class")))
+            identities.update(_app_identity_aliases(client.get("initialClass")))
+        if requested.isdisjoint(identities):
+            continue
+        seen_addresses.add(geometry["address"])
+        geometry["requested_app"] = requested_app
+        geometry["identity_aliases"] = tuple(sorted(identities))
+        matches.append(geometry)
+    return matches
 
 
 # Env var cua-driver reads to gate its anonymous usage telemetry (PostHog).
@@ -2548,6 +2666,9 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_window_id: Optional[int] = None
         self._active_desktop_display_id: Optional[str] = None
         self._active_desktop_geometry: Optional[Dict[str, float]] = None
+        # Explicitly degraded native-Wayland target. It carries no synthetic
+        # CUA window identity or semantic elements.
+        self._active_hyprland_fallback: Optional[Dict[str, Any]] = None
         self._last_app: Optional[str] = None  # last app name targeted via capture/focus_app
         # Exact identity for capture_after. App names may be generic on Linux
         # (for example, multiple unrelated Qt windows can say Qt6Application).
@@ -2713,6 +2834,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_window_id = None
         self._active_desktop_display_id = None
         self._active_desktop_geometry = None
+        self._active_hyprland_fallback = None
         self._last_app = None
         self._last_target = None
         self._snapshot_tokens = {}
@@ -2827,6 +2949,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_window_id = None
         self._active_desktop_display_id = _PRIMARY_DESKTOP_TARGET["display_id"]
         self._active_desktop_geometry = geometry
+        self._active_hyprland_fallback = None
         self._last_app = app
         self._last_target = None
         self._snapshot_tokens = {}
@@ -2840,6 +2963,210 @@ class CuaDriverBackend(ComputerUseBackend):
             window_title="Desktop (primary)",
             png_bytes_len=png_bytes_len,
             image_mime_type=image_mime_type,
+        )
+
+    def _hyprland_visual_fallback_available(self, app: Optional[str]) -> bool:
+        """Whether a failed explicit CUA app match may use this visual route."""
+        return bool(
+            sys.platform == "linux"
+            and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+            and isinstance(app, str)
+            and app.strip()
+            and app.strip().casefold() not in _SCREEN_CAPTURE_SENTINELS
+            and self._session._has_tool("get_desktop_state")
+            and self._session._has_tool("get_screen_size")
+            and self._session.supports_input_property("click", "target")
+        )
+
+    def _capture_hyprland_visual_fallback(
+        self,
+        mode: str,
+        app: str,
+    ) -> Optional[CaptureResult]:
+        """Crop one uniquely matched Hyprland client from the desktop image."""
+        if not self._hyprland_visual_fallback_available(app):
+            return None
+        matches = _matching_hyprland_clients(_hyprctl_json("clients"), app)
+        if len(matches) != 1:
+            return None
+        client = matches[0]
+
+        try:
+            desktop_out = self._call_capture_tool(
+                "get_desktop_state", {"session": self._session_id},
+            )
+            screen_out = self._call_capture_tool(
+                "get_screen_size", {"session": self._session_id},
+            )
+        except Exception:
+            return None
+
+        png_b64, _desktop_mime = _image_from_tool_result(desktop_out)
+        raw_screen = screen_out.get("structuredContent")
+        screen = raw_screen if isinstance(raw_screen, dict) else {}
+        logical_width = _finite_number(screen.get("width"))
+        logical_height = _finite_number(screen.get("height"))
+        if not png_b64 or not logical_width or not logical_height:
+            return None
+
+        current_matches = _matching_hyprland_clients(
+            _hyprctl_json("clients"), app,
+        )
+        if len(current_matches) != 1 or current_matches[0] != client:
+            return None
+
+        try:
+            raw = base64.b64decode(png_b64, validate=False)
+            with Image.open(BytesIO(raw)) as desktop_image:
+                desktop_image.load()
+                screenshot_width, screenshot_height = desktop_image.size
+                if screenshot_width <= 0 or screenshot_height <= 0:
+                    return None
+                scale_x = screenshot_width / logical_width
+                scale_y = screenshot_height / logical_height
+                if not (
+                    math.isfinite(scale_x) and scale_x > 0
+                    and math.isfinite(scale_y) and scale_y > 0
+                ):
+                    return None
+
+                x = client["x"]
+                y = client["y"]
+                width = client["width"]
+                height = client["height"]
+                # The generic desktop API targets the primary display and
+                # exposes no portable origin, so only wholly contained clients
+                # are safe to crop and address.
+                if (
+                    x < 0 or y < 0
+                    or x + width > logical_width
+                    or y + height > logical_height
+                ):
+                    return None
+                left = round(x * scale_x)
+                top = round(y * scale_y)
+                right = round((x + width) * scale_x)
+                bottom = round((y + height) * scale_y)
+                if not (
+                    0 <= left < right <= screenshot_width
+                    and 0 <= top < bottom <= screenshot_height
+                ):
+                    return None
+                cropped = desktop_image.crop((left, top, right, bottom))
+                encoded = BytesIO()
+                cropped.save(encoded, format="PNG")
+                cropped_raw = encoded.getvalue()
+        except Exception:
+            return None
+
+        crop_width = right - left
+        crop_height = bottom - top
+        self._active_pid = None
+        self._active_window_id = None
+        self._active_desktop_display_id = _PRIMARY_DESKTOP_TARGET["display_id"]
+        self._active_desktop_geometry = None
+        self._active_hyprland_fallback = {
+            **client,
+            "desktop_x": 0.0,
+            "desktop_y": 0.0,
+            "desktop_width": logical_width,
+            "desktop_height": logical_height,
+            "screenshot_width": screenshot_width,
+            "screenshot_height": screenshot_height,
+            "scale_x": scale_x,
+            "scale_y": scale_y,
+            "crop_left": left,
+            "crop_top": top,
+            "crop_width": crop_width,
+            "crop_height": crop_height,
+        }
+        self._last_app = app
+        self._last_target = None
+        self._snapshot_tokens = {}
+        return CaptureResult(
+            mode=mode,
+            width=crop_width,
+            height=crop_height,
+            png_b64=base64.b64encode(cropped_raw).decode("ascii"),
+            elements=[],
+            app=app,
+            window_title="Visual-only Hyprland crop (no semantic elements)",
+            png_bytes_len=len(cropped_raw),
+            image_mime_type="image/png",
+        )
+
+    def _hyprland_fallback_client_is_current(self) -> bool:
+        """Revalidate sticky address, exact identity, and geometry before input."""
+        fallback = self._active_hyprland_fallback
+        if not isinstance(fallback, dict):
+            return False
+        clients = _hyprctl_json("clients")
+        if not isinstance(clients, list):
+            return False
+        for raw in clients:
+            geometry = _hyprland_client_geometry(raw)
+            if geometry is None or geometry["address"] != fallback.get("address"):
+                continue
+            identities: set[str] = set()
+            if isinstance(raw, dict):
+                identities.update(_app_identity_aliases(raw.get("class")))
+                identities.update(_app_identity_aliases(raw.get("initialClass")))
+            requested = _app_identity_aliases(fallback.get("requested_app"))
+            if requested.isdisjoint(identities):
+                return False
+            return all(
+                math.isclose(geometry[key], fallback[key], abs_tol=1e-6)
+                for key in ("x", "y", "width", "height")
+            )
+        return False
+
+    def _translate_hyprland_crop_point(
+        self,
+        x: Any,
+        y: Any,
+    ) -> Optional[Tuple[Any, Any]]:
+        """Map one crop screenshot-pixel point to desktop logical space."""
+        fallback = self._active_hyprland_fallback
+        local_x = _finite_number(x)
+        local_y = _finite_number(y)
+        if not isinstance(fallback, dict) or local_x is None or local_y is None:
+            return None
+        if not (
+            0 <= local_x < fallback["crop_width"]
+            and 0 <= local_y < fallback["crop_height"]
+        ):
+            return None
+        desktop_x = (
+            fallback["desktop_x"]
+            + ((fallback["crop_left"] + local_x) / fallback["scale_x"])
+        )
+        desktop_y = (
+            fallback["desktop_y"]
+            + ((fallback["crop_top"] + local_y) / fallback["scale_y"])
+        )
+        if not (
+            fallback["x"] <= desktop_x < fallback["x"] + fallback["width"]
+            and fallback["y"] <= desktop_y < fallback["y"] + fallback["height"]
+        ):
+            return None
+
+        def _clean(value: float) -> Any:
+            rounded = round(value, 6)
+            return int(rounded) if rounded.is_integer() else rounded
+
+        return _clean(desktop_x), _clean(desktop_y)
+
+    def _hyprland_fallback_is_focused(self) -> bool:
+        """Verify that the exact fallback address currently owns keyboard focus."""
+        fallback = self._active_hyprland_fallback
+        active = _hyprctl_json("activewindow")
+        if not isinstance(fallback, dict) or not isinstance(active, dict):
+            return False
+        address = active.get("address")
+        return bool(
+            isinstance(address, str)
+            and _HYPRLAND_ADDRESS_RE.fullmatch(address)
+            and address.casefold() == fallback.get("address")
         )
 
     def _desktop_input_target(self, tool: str) -> Optional[Dict[str, str]]:
@@ -3147,6 +3474,11 @@ class CuaDriverBackend(ComputerUseBackend):
                 self._clear_active_target()
                 raise
             if not windows:
+                visual_fallback = self._capture_hyprland_visual_fallback(
+                    mode, app or "",
+                )
+                if visual_fallback is not None:
+                    return visual_fallback
                 # Diagnose instead of returning a bare 0x0: the dominant
                 # real-world cause on Linux is a locked desktop session.
                 return self._failed_capture(mode, _empty_discovery_reason())
@@ -3194,6 +3526,9 @@ class CuaDriverBackend(ComputerUseBackend):
         elif pid is None and window_id is None and app:
             filtered = self._match_windows_for_app(windows, app)
             if not filtered:
+                visual_fallback = self._capture_hyprland_visual_fallback(mode, app)
+                if visual_fallback is not None:
+                    return visual_fallback
                 return self._failed_capture(
                     mode,
                     (
@@ -3219,6 +3554,7 @@ class CuaDriverBackend(ComputerUseBackend):
         self._active_window_id = target["window_id"]
         self._active_desktop_display_id = None
         self._active_desktop_geometry = None
+        self._active_hyprland_fallback = None
         # Tokens belong to the prior window snapshot. Disarm them before any
         # capture call so an exception cannot pair old tokens with this target.
         self._snapshot_tokens = {}
@@ -3568,9 +3904,27 @@ class CuaDriverBackend(ComputerUseBackend):
                     action="click",
                     message="click requires x/y after desktop capture.",
                 )
-            translated = self._translate_wayland_desktop_point(x, y)
-            if translated is None:
-                return self._desktop_coordinate_mapping_invalid("click")
+            if self._active_hyprland_fallback:
+                translated = self._translate_hyprland_crop_point(x, y)
+                if (
+                    translated is None
+                    or not self._hyprland_fallback_client_is_current()
+                ):
+                    return ActionResult(
+                        ok=False,
+                        action="click",
+                        code="hyprland_visual_target_stale",
+                        degraded=True,
+                        message=(
+                            "The visual-only Hyprland target is missing, moved, "
+                            "changed identity, or the crop coordinate is outside "
+                            "its bounds. Capture the exact app again before clicking."
+                        ),
+                    )
+            else:
+                translated = self._translate_wayland_desktop_point(x, y)
+                if translated is None:
+                    return self._desktop_coordinate_mapping_invalid("click")
             target = self._desktop_input_target("click")
             if target is None:
                 return self._desktop_input_unsupported("click")
@@ -3655,10 +4009,30 @@ class CuaDriverBackend(ComputerUseBackend):
                     action="drag",
                     message="drag requires coordinate pairs after desktop capture.",
                 )
-            translated_from = self._translate_wayland_desktop_point(*from_xy)
-            translated_to = self._translate_wayland_desktop_point(*to_xy)
-            if translated_from is None or translated_to is None:
-                return self._desktop_coordinate_mapping_invalid("drag")
+            if self._active_hyprland_fallback:
+                translated_from = self._translate_hyprland_crop_point(*from_xy)
+                translated_to = self._translate_hyprland_crop_point(*to_xy)
+                if (
+                    translated_from is None
+                    or translated_to is None
+                    or not self._hyprland_fallback_client_is_current()
+                ):
+                    return ActionResult(
+                        ok=False,
+                        action="drag",
+                        code="hyprland_visual_target_stale",
+                        degraded=True,
+                        message=(
+                            "The visual-only Hyprland target is missing, moved, "
+                            "changed identity, or a crop coordinate is outside "
+                            "its bounds. Capture the exact app again before dragging."
+                        ),
+                    )
+            else:
+                translated_from = self._translate_wayland_desktop_point(*from_xy)
+                translated_to = self._translate_wayland_desktop_point(*to_xy)
+                if translated_from is None or translated_to is None:
+                    return self._desktop_coordinate_mapping_invalid("drag")
             target = self._desktop_input_target("drag")
             if target is None:
                 return self._desktop_input_unsupported("drag")
@@ -3716,10 +4090,39 @@ class CuaDriverBackend(ComputerUseBackend):
                     message="Desktop capture has no element indices; use coordinates.",
                 )
             if x is None or y is None:
+                if self._active_hyprland_fallback:
+                    return ActionResult(
+                        ok=False,
+                        action="scroll",
+                        code="hyprland_visual_coordinate_required",
+                        degraded=True,
+                        message=(
+                            "Visual-only Hyprland scroll requires crop-local x/y "
+                            "coordinates from the latest capture."
+                        ),
+                    )
                 return self._desktop_coordinate_mapping_invalid("scroll")
-            translated = self._translate_wayland_desktop_point(x, y)
-            if translated is None:
-                return self._desktop_coordinate_mapping_invalid("scroll")
+            if self._active_hyprland_fallback:
+                translated = self._translate_hyprland_crop_point(x, y)
+                if (
+                    translated is None
+                    or not self._hyprland_fallback_client_is_current()
+                ):
+                    return ActionResult(
+                        ok=False,
+                        action="scroll",
+                        code="hyprland_visual_target_stale",
+                        degraded=True,
+                        message=(
+                            "The visual-only Hyprland target is missing, moved, "
+                            "changed identity, or the crop coordinate is outside "
+                            "its bounds. Capture the exact app again before scrolling."
+                        ),
+                    )
+            else:
+                translated = self._translate_wayland_desktop_point(x, y)
+                if translated is None:
+                    return self._desktop_coordinate_mapping_invalid("scroll")
             target = self._desktop_input_target("scroll")
             if target is None:
                 return self._desktop_input_unsupported("scroll")
@@ -3770,6 +4173,33 @@ class CuaDriverBackend(ComputerUseBackend):
         pid = self._active_pid
         window_id = self._active_window_id
         if pid is None or window_id is None:
+            if self._active_hyprland_fallback:
+                target = self._desktop_input_target("type_text")
+                if target is None:
+                    return self._desktop_input_unsupported("type_text")
+                if (
+                    bring_to_front
+                    or not self._hyprland_fallback_client_is_current()
+                    or not self._hyprland_fallback_is_focused()
+                ):
+                    return ActionResult(
+                        ok=False,
+                        action="type_text",
+                        code="hyprland_visual_focus_required",
+                        degraded=True,
+                        message=(
+                            "Typing is blocked for this visual-only Hyprland target "
+                            "until fresh client identity, geometry, and active-window "
+                            "checks confirm the same client is already focused. "
+                            "Hermes will not force focus."
+                        ),
+                    )
+                return self._run_input_action(
+                    "type_text",
+                    {"text": text, "target": target},
+                    delivery_mode,
+                    False,
+                )
             return ActionResult(ok=False, action="type_text",
                                 message="No active window — call capture() first.")
         args: Dict[str, Any] = {"pid": pid, "window_id": window_id, "text": text}

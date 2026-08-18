@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 from io import BytesIO
+import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -439,3 +441,440 @@ def test_generic_wayland_normal_app_keeps_semantic_window_route(monkeypatch):
     assert not any(name == "get_desktop_state" for name, _ in session.calls)
     assert session.calls[-1][0] == "click"
     assert session.calls[-1][1]["element_index"] == 1
+
+
+class _HyprlandSession(_GenericWaylandSession):
+    def _has_tool(self, name):
+        return name in {
+            "get_desktop_state", "get_screen_size", "get_window_state",
+            "click", "drag", "scroll", "type_text",
+        }
+
+    def supports_input_property(self, tool, prop):
+        if prop == "target":
+            return tool in {"click", "drag", "scroll", "type_text"}
+        return super().supports_input_property(tool, prop)
+
+
+def _hyprland_client(address="0xabc123", app_class="chromium", title="Private"):
+    return {
+        "address": address,
+        "class": app_class,
+        "initialClass": app_class,
+        "title": title,
+        "pid": 4321,
+        "at": [20, 10],
+        "size": [40, 30],
+        "mapped": True,
+        "hidden": False,
+        "monitor": 0,
+    }
+
+
+def _mock_hyprctl(monkeypatch, clients, *, active=None, calls=None):
+    def _run(args, **kwargs):
+        if calls is not None:
+            calls.append((list(args), dict(kwargs)))
+        payload = clients if args[-1] == "clients" else (active or {})
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr("tools.computer_use.cua_backend.subprocess.run", _run)
+
+
+def _mock_hyprctl_client_snapshots(monkeypatch, snapshots, *, calls):
+    remaining = iter(snapshots)
+
+    def _run(args, **kwargs):
+        if args[:3] != ["hyprctl", "-j", "clients"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        calls.append((list(args), dict(kwargs)))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(next(remaining)),
+            stderr="",
+        )
+
+    monkeypatch.setattr("tools.computer_use.cua_backend.subprocess.run", _run)
+
+
+@pytest.mark.linux_only
+def test_hyprland_unique_app_fallback_crops_and_uses_safe_query(monkeypatch):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    calls = []
+    client = _hyprland_client(title="Private browsing title")
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl(monkeypatch, [client], calls=calls)
+    session = _HyprlandSession(pixel_size=(200, 100), logical_size=(200, 100))
+    backend = CuaDriverBackend()
+    backend._session = session
+
+    capture = backend.capture(mode="som", app="chromium")
+
+    assert (capture.width, capture.height) == (40, 30)
+    assert capture.png_b64
+    assert capture.elements == []
+    assert capture.app == "chromium"
+    assert "visual-only" in capture.window_title.lower()
+    assert backend._active_pid is None
+    assert backend._active_window_id is None
+    assert backend._active_hyprland_fallback["address"] == client["address"]
+    args, kwargs = calls[0]
+    assert args == ["hyprctl", "-j", "clients"]
+    assert kwargs["timeout"] == 2.0
+    assert "shell" not in kwargs
+    assert [name for name, _ in session.calls][-2:] == [
+        "get_desktop_state", "get_screen_size",
+    ]
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "changed_client",
+    [
+        {**_hyprland_client(), "at": [21, 10]},
+        {
+            **_hyprland_client(),
+            "class": "firefox",
+            "initialClass": "chromium",
+        },
+    ],
+    ids=["moved", "changed-identity"],
+)
+def test_hyprland_capture_revalidates_client_before_crop(
+    monkeypatch, changed_client,
+):
+    from tools.computer_use.cua_backend import CuaDriverBackend, Image
+
+    initial = _hyprland_client()
+    calls = []
+    crop_calls = []
+    original_crop = Image.Image.crop
+
+    def _track_crop(image, box, *args, **kwargs):
+        crop_calls.append(box)
+        return original_crop(image, box, *args, **kwargs)
+
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl_client_snapshots(
+        monkeypatch, [[initial], [changed_client]], calls=calls,
+    )
+    monkeypatch.setattr(Image.Image, "crop", _track_crop)
+    backend = CuaDriverBackend()
+    backend._session = _HyprlandSession(
+        pixel_size=(200, 100), logical_size=(200, 100),
+    )
+
+    capture = backend.capture(mode="som", app="chromium")
+
+    assert (capture.width, capture.height) == (0, 0)
+    assert not capture.png_b64
+    assert crop_calls == []
+    assert [args for args, _ in calls] == [
+        ["hyprctl", "-j", "clients"],
+        ["hyprctl", "-j", "clients"],
+    ]
+
+
+@pytest.mark.linux_only
+def test_hyprland_capture_crops_when_post_screenshot_client_is_unchanged(
+    monkeypatch,
+):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    client = _hyprland_client()
+    calls = []
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl_client_snapshots(
+        monkeypatch, [[client], [client]], calls=calls,
+    )
+    backend = CuaDriverBackend()
+    backend._session = _HyprlandSession(
+        pixel_size=(200, 100), logical_size=(200, 100),
+    )
+
+    capture = backend.capture(mode="som", app="chromium")
+
+    assert (capture.width, capture.height) == (40, 30)
+    assert capture.png_b64
+    assert [args for args, _ in calls] == [
+        ["hyprctl", "-j", "clients"],
+        ["hyprctl", "-j", "clients"],
+    ]
+
+
+@pytest.mark.linux_only
+def test_hyprland_fallback_ignores_unrelated_cua_row(monkeypatch):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    unrelated = {
+        "app_name": "gcr-prompter",
+        "pid": 9876,
+        "window_id": 77,
+        "title": "",
+        "is_on_screen": True,
+        "z_index": 1,
+    }
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl(monkeypatch, [_hyprland_client()])
+    session = _HyprlandSession(
+        pixel_size=(200, 100), logical_size=(200, 100), windows=[unrelated],
+    )
+    backend = CuaDriverBackend()
+    backend._session = session
+
+    capture = backend.capture(mode="som", app="chromium")
+
+    assert (capture.width, capture.height) == (40, 30)
+    assert capture.elements == []
+    assert backend._active_window_id is None
+
+
+@pytest.mark.linux_only
+def test_hyprland_matching_cua_row_always_wins(monkeypatch):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    matching = {
+        "app_name": "chromium",
+        "pid": 9876,
+        "window_id": 77,
+        "title": "",
+        "is_on_screen": True,
+        "z_index": 1,
+    }
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    monkeypatch.setattr(
+        "tools.computer_use.cua_backend.subprocess.run",
+        lambda *args, **kwargs: pytest.fail(
+            "Hyprland fallback must not run for a matching CUA row"
+        ),
+    )
+    session = _HyprlandSession(windows=[matching])
+    backend = CuaDriverBackend()
+    backend._session = session
+
+    capture = backend.capture(mode="som", app="chromium")
+
+    assert len(capture.elements) == 1
+    assert backend._active_pid == 9876
+    assert backend._active_window_id == 77
+    assert backend._active_hyprland_fallback is None
+    assert not any(name == "get_desktop_state" for name, _ in session.calls)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "clients",
+    [
+        [_hyprland_client("0xabc123"), _hyprland_client("0xdef456")],
+        [{**_hyprland_client(), "address": "not-an-address"}],
+        [{**_hyprland_client(), "size": [float("nan"), 30]}],
+        "not-a-list",
+    ],
+    ids=["ambiguous", "bad-address", "bad-geometry", "malformed-payload"],
+)
+def test_hyprland_visual_fallback_malformed_or_ambiguous_fails_closed(
+    monkeypatch, clients,
+):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl(monkeypatch, clients)
+    session = _HyprlandSession()
+    backend = CuaDriverBackend()
+    backend._session = session
+
+    capture = backend.capture(mode="som", app="chromium")
+
+    assert (capture.width, capture.height) == (0, 0)
+    assert backend._active_desktop_display_id is None
+    assert not any(name == "get_desktop_state" for name, _ in session.calls)
+
+
+@pytest.mark.linux_only
+def test_non_hyprland_app_no_match_preserves_existing_failure(monkeypatch):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+    from tools.computer_use import cua_backend
+
+    monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE", raising=False)
+    real_run = cua_backend.subprocess.run
+
+    def _run(args, **kwargs):
+        if args and args[0] == "hyprctl":
+            pytest.fail("hyprctl must not run outside Hyprland")
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr("tools.computer_use.cua_backend.subprocess.run", _run)
+    session = _HyprlandSession()
+    backend = CuaDriverBackend()
+    backend._session = session
+
+    capture = backend.capture(mode="som", app="chromium")
+
+    assert (capture.width, capture.height) == (0, 0)
+    assert backend._active_desktop_display_id is None
+    assert not any(name == "get_desktop_state" for name, _ in session.calls)
+
+
+@pytest.mark.linux_only
+def test_hyprland_rejects_unsafe_reverse_dns_leaf_alias():
+    from tools.computer_use.cua_backend import _matching_hyprland_clients
+
+    client = _hyprland_client(app_class="org.example.chromium")
+
+    assert _matching_hyprland_clients([client], "chromium") == []
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    ("app_class", "requested_app"),
+    [
+        ("Chromium", "chromium"),
+        ("google-chrome", "Google Chrome"),
+        ("org.chromium.Chromium", "chromium"),
+        ("org.mozilla.firefox", "firefox"),
+    ],
+)
+def test_hyprland_preserves_explicit_safe_identity_matches(
+    app_class, requested_app,
+):
+    from tools.computer_use.cua_backend import _matching_hyprland_clients
+
+    assert len(_matching_hyprland_clients(
+        [_hyprland_client(app_class=app_class)], requested_app,
+    )) == 1
+
+
+@pytest.mark.linux_only
+def test_hyprland_type_requires_current_identity_geometry_and_active_address(
+    monkeypatch,
+):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    original = _hyprland_client()
+    current = {"client": original, "active": "0xother123"}
+    calls = []
+
+    def _run(args, **kwargs):
+        calls.append(list(args))
+        payload = (
+            [current["client"]]
+            if args[-1] == "clients"
+            else {**current["client"], "address": current["active"]}
+        )
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    monkeypatch.setattr("tools.computer_use.cua_backend.subprocess.run", _run)
+    session = _HyprlandSession(pixel_size=(200, 100), logical_size=(200, 100))
+    backend = CuaDriverBackend()
+    backend._session = session
+    backend.capture(mode="som", app="chromium")
+
+    wrong_focus = backend.type_text("blocked focus")
+    current["active"] = original["address"]
+    allowed = backend.type_text("allowed")
+    current["client"] = {**original, "at": [21, 10]}
+    moved = backend.type_text("blocked moved")
+    current["client"] = {
+        **original, "class": "firefox", "initialClass": "firefox",
+    }
+    reused = backend.type_text("blocked reused")
+    forced = backend.type_text("blocked force", bring_to_front=True)
+
+    assert wrong_focus.code == "hyprland_visual_focus_required"
+    assert allowed.ok is True
+    assert moved.code == "hyprland_visual_focus_required"
+    assert reused.code == "hyprland_visual_focus_required"
+    assert forced.code == "hyprland_visual_focus_required"
+    assert [call[1]["text"] for call in session.calls if call[0] == "type_text"] == [
+        "allowed",
+    ]
+    assert all("dispatch" not in args for args in calls)
+
+
+@pytest.mark.linux_only
+def test_hyprland_fractional_scale_maps_pointer_actions(monkeypatch):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    client = {**_hyprland_client(), "at": [21, 11]}
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl(monkeypatch, [client])
+    session = _HyprlandSession(pixel_size=(300, 150), logical_size=(200, 100))
+    backend = CuaDriverBackend()
+    backend._session = session
+
+    capture = backend.capture(mode="som", app="chromium")
+    clicked = backend.click(x=1, y=1)
+    dragged = backend.drag(from_xy=(1, 1), to_xy=(31, 16))
+    scrolled = backend.scroll(direction="down", amount=4, x=15, y=9)
+
+    assert (capture.width, capture.height) == (60, 46)
+    assert clicked.ok and dragged.ok and scrolled.ok
+    assert (session.calls[-3][1]["x"], session.calls[-3][1]["y"]) == (
+        22, 11.333333,
+    )
+    assert (
+        session.calls[-2][1]["from_x"], session.calls[-2][1]["from_y"],
+        session.calls[-2][1]["to_x"], session.calls[-2][1]["to_y"],
+    ) == (22, 11.333333, 42, 21.333333)
+    assert (session.calls[-1][1]["x"], session.calls[-1][1]["y"]) == (
+        31.333333, 16.666667,
+    )
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("action", ["click", "drag", "scroll"])
+def test_hyprland_fractional_scale_rejects_rounded_edge_escape(
+    monkeypatch, action,
+):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    client = {**_hyprland_client(), "at": [19, 10]}
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl(monkeypatch, [client])
+    session = _HyprlandSession(pixel_size=(300, 150), logical_size=(200, 100))
+    backend = CuaDriverBackend()
+    backend._session = session
+    backend.capture(mode="som", app="chromium")
+
+    if action == "click":
+        blocked = backend.click(x=0, y=1)
+        allowed = backend.click(x=1, y=1)
+    elif action == "drag":
+        blocked = backend.drag(from_xy=(0, 1), to_xy=(10, 10))
+        allowed = backend.drag(from_xy=(1, 1), to_xy=(10, 10))
+    else:
+        blocked = backend.scroll(direction="down", x=0, y=1)
+        allowed = backend.scroll(direction="down", x=1, y=1)
+
+    assert blocked.ok is False
+    assert blocked.code == "hyprland_visual_target_stale"
+    assert allowed.ok is True
+    action_calls = [call for call in session.calls if call[0] == action]
+    assert len(action_calls) == 1
+
+
+@pytest.mark.linux_only
+def test_hyprland_visual_fallback_never_logs_or_surfaces_title(monkeypatch, caplog):
+    from tools.computer_use.cua_backend import CuaDriverBackend
+
+    private_title = "Secret customer document - Incognito"
+    client = _hyprland_client(title=private_title)
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "test-hyprland")
+    _mock_hyprctl(monkeypatch, [client])
+    backend = CuaDriverBackend()
+    backend._session = _HyprlandSession(
+        pixel_size=(200, 100), logical_size=(200, 100),
+    )
+
+    with caplog.at_level("DEBUG"):
+        capture = backend.capture(mode="som", app="chromium")
+
+    assert capture.width == 40
+    assert private_title not in caplog.text
+    assert private_title not in capture.window_title
